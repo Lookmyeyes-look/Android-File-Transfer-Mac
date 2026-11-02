@@ -4,6 +4,7 @@ import os
 import json
 import logging
 import shlex
+import shutil
 from pathlib import Path, PurePosixPath
 from datetime import datetime
 from PyQt6.QtWidgets import (
@@ -36,9 +37,52 @@ class AndroidFileManager:
         self.logger = logging.getLogger(__name__)
         self.logger.info("Android File Manager initialized")
 
+        # GUI applications launched from Finder do not inherit the shell PATH,
+        # so resolve ADB once and use its absolute path for every command.
+        self.adb_path = self.find_adb_path()
+        if self.adb_path:
+            self.logger.info(f"Using ADB executable: {self.adb_path}")
+
         # Setup backup directory
         self.backup_base_dir = Path(__file__).parent / "storage" / "data" / "backups"
         self.backup_base_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def find_adb_path():
+        """Find an executable ADB binary in PATH and common macOS locations."""
+        candidates = []
+
+        # Allow an explicit override, then prefer the caller's PATH.
+        explicit_path = os.environ.get("ADB_PATH")
+        if explicit_path:
+            candidates.append(Path(explicit_path).expanduser())
+
+        path_adb = shutil.which("adb")
+        if path_adb:
+            candidates.append(Path(path_adb))
+
+        # Android Studio and command-line SDK installations.
+        for variable in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+            sdk_root = os.environ.get(variable)
+            if sdk_root:
+                candidates.append(Path(sdk_root).expanduser() / "platform-tools" / "adb")
+
+        candidates.extend([
+            Path("/opt/homebrew/bin/adb"),  # Apple Silicon Homebrew
+            Path("/usr/local/bin/adb"),    # Intel Homebrew
+            Path.home() / "Library" / "Android" / "sdk" / "platform-tools" / "adb",
+        ])
+
+        seen = set()
+        for candidate in candidates:
+            candidate_string = str(candidate)
+            if candidate_string in seen:
+                continue
+            seen.add(candidate_string)
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate_string
+
+        return None
         
     def ensure_device_connected(self):
         """Ensure a device is connected before performing operations
@@ -105,6 +149,18 @@ class AndroidFileManager:
                 self.logger.error(error_msg)
                 raise ValueError(error_msg)
 
+            if not shell and command and command[0] == "adb":
+                if not self.adb_path:
+                    self.adb_path = self.find_adb_path()
+                if not self.adb_path:
+                    error_msg = (
+                        "ADB executable was not found. Install Android Platform Tools "
+                        "or set ADB_PATH to the full path of the adb executable."
+                    )
+                    self.logger.error(error_msg)
+                    return None, error_msg, 1
+                command = [self.adb_path, *command[1:]]
+
             self.logger.debug(f"Running ADB command: {command}")
 
             result = subprocess.run(
@@ -128,33 +184,31 @@ class AndroidFileManager:
             return None, str(e), 1
     
     def check_adb_available(self):
-        """Check if ADB is available in PATH
+        """Check whether ADB can be found and executed.
 
         Returns:
             tuple: (is_available, error_message)
         """
-        try:
-            result = subprocess.run(
-                ["adb", "version"],
-                capture_output=True,
-                text=True,
-                timeout=5
+        self.adb_path = self.find_adb_path()
+        if not self.adb_path:
+            error_msg = (
+                "ADB was not found. Install Android SDK Platform Tools, or set "
+                "ADB_PATH to the full path of the adb executable."
             )
-            if result.returncode == 0:
-                self.logger.info(f"ADB is available: {result.stdout.strip().split()[0]}")
+            self.logger.error(error_msg)
+            return False, error_msg
+
+        try:
+            stdout, stderr, returncode = self.run_adb_command(["adb", "version"], timeout=5)
+            if returncode == 0:
+                version_lines = (stdout or "").strip().splitlines()
+                version_line = version_lines[0] if version_lines else "unknown version"
+                self.logger.info(f"ADB is available at {self.adb_path}: {version_line}")
                 return True, None
             else:
-                error_msg = "ADB command failed. Please ensure ADB is properly installed."
+                error_msg = f"ADB command failed: {(stderr or 'unknown error').strip()}"
                 self.logger.error(error_msg)
                 return False, error_msg
-        except FileNotFoundError:
-            error_msg = "ADB not found in PATH. Please install Android SDK Platform Tools and add ADB to your system PATH."
-            self.logger.error(error_msg)
-            return False, error_msg
-        except subprocess.TimeoutExpired:
-            error_msg = "ADB command timed out. There may be an issue with your ADB installation."
-            self.logger.error(error_msg)
-            return False, error_msg
         except Exception as e:
             error_msg = f"Error checking ADB availability: {str(e)}"
             self.logger.error(error_msg)
